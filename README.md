@@ -66,6 +66,7 @@ We evaluate ***FracTrain*** on six models & four datasets (i.e., ResNet-38/74/Mo
 
 
 ## Code Usage
+Our code is inspired by [SkipNet](https://github.com/ucbdrive/skipnet) and we follow its training setting for CIFAR-10/100 and ImageNet.
 
 ### Prerequisites
 See `env.yml` for the complete conda environment. Create a new conda environment:
