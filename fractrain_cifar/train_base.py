@@ -1,6 +1,3 @@
-""" This file is for training original model without routing modules.
-"""
-
 from __future__ import print_function
 
 import torch
@@ -30,7 +27,7 @@ model_names = sorted(name for name in models.__dict__
 def parse_args():
     # hyper-parameters are from ResNet paper
     parser = argparse.ArgumentParser(
-        description='PyTorch CIFAR10 training with gating')
+        description='Quantization Aware Training on CIFAR')
     parser.add_argument('--dir', help='annotate the working directory')
     parser.add_argument('--cmd', choices=['train', 'test'], default='train')
     parser.add_argument('--arch', metavar='ARCH', default='cifar10_resnet_38',

@@ -6,6 +6,8 @@ import torch.backends.cudnn as cudnn
 from torch.autograd import Variable
 import numpy as np
 
+from functools import reduce
+
 import os
 import shutil
 import argparse
@@ -25,7 +27,7 @@ model_names = sorted(name for name in models.__dict__
 def parse_args():
     # hyper-parameters are from ResNet paper
     parser = argparse.ArgumentParser(
-        description='Quantization Aware Training on ImageNet')
+        description='DFQ on ImageNet')
     parser.add_argument('--dir', help='annotate the working directory')
     parser.add_argument('--cmd', choices=['train', 'test'], default='train')
     parser.add_argument('--arch', metavar='ARCH', default='resnet50',
@@ -90,8 +92,18 @@ def parse_args():
                         help='precision of activation gradient during weight gradient computation, -1 means dynamic, 0 means no quantize')
     parser.add_argument('--weight_bits', default=0, type=int,
                         help='precision of weight')
+    parser.add_argument('--target_ratio',default=4,type=float,
+                        help='target compression ratio')
+    parser.add_argument('--target_ratio_schedule',default=None,type=float,nargs='*',
+                        help='schedule for target compression ratio')
     parser.add_argument('--momentum_act', default=0.9, type=float,
                         help='momentum for act min/max')
+    parser.add_argument('--relax', default=0, type=float,
+                        help='relax parameter for target ratio') 
+    parser.add_argument('--beta', default=1e-3, type=float,
+                        help='coefficient')
+    parser.add_argument('--computation_cost', default=True, type=bool,
+                        help='using computation cost as regularization term')
     args = parser.parse_args()
     return args
 
@@ -129,13 +141,40 @@ def main():
             args.arch, args.resume))
         test_model(args)
 
+bits = [3, 4, 6, 8]
+grad_bits = [6, 8, 12, 16]
 
 def run_training(args):
-    # create model
-    model = models.__dict__[args.arch](args.pretrained)
+
+    cost_fw = []
+    for bit in bits:
+        if bit == 0:
+            cost_fw.append(1)
+        else:
+            cost_fw.append(bit/32)
+    cost_fw = np.array(cost_fw) * args.weight_bits/32
+
+    cost_eb = []
+    for bit in grad_bits:
+        if bit == 0:
+            cost_eb.append(1)
+        else:
+            cost_eb.append(bit/32)
+    cost_eb = np.array(cost_eb) * args.weight_bits/32
+
+    cost_gc = []
+    for i in range(len(bits)):
+        if bits[i] == 0:
+            cost_gc.append(1)
+        else:
+            cost_gc.append(bits[i]*grad_bits[i]/32/32)
+    cost_gc = np.array(cost_gc)
+
+    model = models.__dict__[args.arch](args.pretrained, proj_dim=len(bits))
     model = torch.nn.DataParallel(model).cuda()
 
     best_prec1 = 0
+    best_epoch = 0
     best_full_prec = 0
 
     # optionally resume from a checkpoint
@@ -172,23 +211,33 @@ def run_training(args):
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
 
-    # optimizer = torch.optim.Adam(model.parameters(), args.lr,
-    #                             weight_decay=args.weight_decay)
-
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
-    cr = AverageMeter()
+    cp_record = AverageMeter()
+    cp_record_fw = AverageMeter()
+    cp_record_eb = AverageMeter()
+    cp_record_gc = AverageMeter()
+    
+    network_depth = sum(model.module.num_layers)
+
+    layerwise_decision_statistics = []
+    
+    for k in range(network_depth):
+        layerwise_decision_statistics.append([])
+        for j in range(len(cost_fw)):
+            ratio = AverageMeter()
+            layerwise_decision_statistics[k].append(ratio)
 
     end = time.time()
 
     for _epoch in range(args.start_epoch, args.epoch):
         lr = adjust_learning_rate(args, optimizer, _epoch)
-        adjust_precision(args, _epoch)
+        adjust_target_ratio(args, _epoch)
 
         print('Learning Rate:', lr)
-        print('num bits:', args.num_bits, 'num grad bits:', args.num_grad_bits)
+        print('Target Ratio:', args.target_ratio)
 
         for i, (input, target) in enumerate(train_loader):
             # measuring data loading time            
@@ -196,23 +245,70 @@ def run_training(args):
 
             model.train()
 
-            fw_cost = args.num_bits*args.num_bits/32/32
-            eb_cost = args.num_bits*args.num_grad_bits/32/32
-            gc_cost = eb_cost
-            cr.update((fw_cost+eb_cost+gc_cost)/3)
-
             target = target.squeeze().long().cuda()
             input_var = Variable(input).cuda()
             target_var = Variable(target).cuda()
 
-            # compute output
-            output = model(input_var, args.num_bits, args.num_grad_bits)
-            loss = criterion(output, target_var)
+            output, masks = model(input_var, bits, grad_bits)
+            
+            computation_cost_fw = 0
+            computation_cost_eb = 0
+            computation_cost_gc = 0
+            computation_all = 0
+            
+            for layer in range(network_depth):
+                
+                full_layer = reduce((lambda x, y: x * y), masks[layer][0].shape)
+                
+                computation_all  += full_layer
+                
+                for k in range(len(cost_fw)):
+                    
+                    dynamic_choice = masks[layer][k].sum()
+                    
+                    ratio = dynamic_choice / full_layer
+
+                    layerwise_decision_statistics[layer][k].update(ratio.data, 1)
+                    
+                    computation_cost_fw += masks[layer][k].sum() * cost_fw[k]
+                    computation_cost_eb += masks[layer][k].sum() * cost_eb[k]
+                    computation_cost_gc += masks[layer][k].sum() * cost_gc[k]
+            
+            computation_cost = computation_cost_fw + computation_cost_eb + computation_cost_gc
+
+            cp_ratio_fw = (float(computation_cost_fw) / float(computation_all)) * 100
+            cp_ratio_eb = (float(computation_cost_eb) / float(computation_all)) * 100
+            cp_ratio_gc = (float(computation_cost_gc) / float(computation_all)) * 100
+
+            cp_ratio = (float(computation_cost) / float(computation_all*3)) * 100
+                
+            computation_cost *= args.beta
+
+            if cp_ratio < args.target_ratio - args.relax:
+                reg = -1
+            elif cp_ratio >= args.target_ratio + args.relax:
+                reg = 1
+            elif cp_ratio >=args.target_ratio:
+                reg = 0.1
+            else:
+                reg = -0.1
+            
+            loss_cls = criterion(output, target_var)
+
+            if args.computation_cost:
+                loss = loss_cls + computation_cost * reg
+            else:
+                loss = loss_cls
 
             # measure accuracy and record loss
             prec1, = accuracy(output.data, target, topk=(1,))
             losses.update(loss.item(), input.size(0))
             top1.update(prec1.item(), input.size(0))
+
+            cp_record.update(cp_ratio,1)
+            cp_record_fw.update(cp_ratio_fw,1)
+            cp_record_eb.update(cp_ratio_eb,1)
+            cp_record_gc.update(cp_ratio_gc,1)
 
             # compute gradient and do SGD step
             optimizer.zero_grad()
@@ -229,14 +325,22 @@ def run_training(args):
                              "Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t"
                              "Data {data_time.val:.3f} ({data_time.avg:.3f})\t"
                              "Loss {loss.val:.3f} ({loss.avg:.3f})\t"
-                             "Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t".format(
+                             "Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t"
+                             "Computation_Percentage: {cp_record.val:.3f}({cp_record.avg:.3f})\t"
+                             "Computation_Percentage_FW: {cp_record_fw.val:.3f}({cp_record_fw.avg:.3f})\t"
+                             "Computation_Percentage_EB: {cp_record_eb.val:.3f}({cp_record_eb.avg:.3f})\t"
+                             "Computation_Percentage_GC: {cp_record_gc.val:.3f}({cp_record_gc.avg:.3f})\t".format(
                                 _epoch,
                                 i,
                                 len(train_loader),
                                 batch_time=batch_time,
                                 data_time=data_time,
                                 loss=losses,
-                                top1=top1)
+                                top1=top1,
+                                cp_record=cp_record,
+                                cp_record_fw=cp_record_fw,
+                                cp_record_eb=cp_record_eb,
+                                cp_record_gc=cp_record_gc)
                 )
 
         with torch.no_grad():
@@ -244,10 +348,12 @@ def run_training(args):
             # prec_full = validate_full_prec(args, test_loader, model, criterion, i)
 
         is_best = prec1 > best_prec1
-        best_prec1 = max(prec1, best_prec1)
+        if is_best:
+            best_prec1 = prec1
+            best_epoch = _epoch
         #best_full_prec = max(prec_full, best_full_prec)
 
-        print("Current Best Prec@1: ", best_prec1)
+        print("Current Best Prec@1: ", best_prec1, "Best Epoch:", best_epoch)
         #print("Current Best Full Prec@1: ", best_full_prec)
         
         checkpoint_path = os.path.join(args.save_path, 'checkpoint_{:05d}_{:.2f}.pth.tar'.format(_epoch, prec1))
@@ -265,11 +371,50 @@ def run_training(args):
 
 
 def validate(args, test_loader, model, criterion, _epoch):
+
+    cost_fw = []
+    for bit in bits:
+        if bit == 0:
+            cost_fw.append(1)
+        else:
+            cost_fw.append(bit/32)
+    cost_fw = np.array(cost_fw) * args.weight_bits/32
+
+    cost_eb = []
+    for bit in grad_bits:
+        if bit == 0:
+            cost_eb.append(1)
+        else:
+            cost_eb.append(bit/32)
+    cost_eb = np.array(cost_eb) * args.weight_bits/32
+
+    cost_gc = []
+    for i in range(len(bits)):
+        if bits[i] == 0:
+            cost_gc.append(1)
+        else:
+            cost_gc.append(bits[i]*grad_bits[i]/32/32)
+    cost_gc = np.array(cost_gc)
+
     batch_time = AverageMeter()
+    data_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
+    cp_record = AverageMeter()
+    cp_record_fw = AverageMeter()
+    cp_record_eb = AverageMeter()
+    cp_record_gc = AverageMeter()
+    
+    network_depth = sum(model.module.num_layers)
 
-    # switch to evaluation mode
+    layerwise_decision_statistics = []
+    
+    for k in range(network_depth):
+        layerwise_decision_statistics.append([])
+        for j in range(len(cost_fw)):
+            ratio = AverageMeter()
+            layerwise_decision_statistics[k].append(ratio)
+
     model.eval()
     end = time.time()
     for i, (input, target) in enumerate(test_loader):
@@ -277,29 +422,83 @@ def validate(args, test_loader, model, criterion, _epoch):
         input_var = Variable(input, volatile=True).cuda()
         target_var = Variable(target, volatile=True).cuda()
 
-        # compute output
-        output = model(input_var, args.num_bits, args.num_grad_bits)
+        output, masks = model(input_var, bits, grad_bits)
+        
+        computation_cost_fw = 0
+        computation_cost_eb = 0
+        computation_cost_gc = 0
+        computation_all = 0
+        
+        for layer in range(network_depth):
+            
+            full_layer = reduce((lambda x, y: x * y), masks[layer][0].shape)
+            
+            computation_all  += full_layer
+            
+            for k in range(len(cost_fw)):
+                
+                dynamic_choice = masks[layer][k].sum()
+                
+                ratio = dynamic_choice / full_layer
+
+                layerwise_decision_statistics[layer][k].update(ratio.data, 1)
+                
+                computation_cost_fw += masks[layer][k].sum() * cost_fw[k]
+                computation_cost_eb += masks[layer][k].sum() * cost_eb[k]
+                computation_cost_gc += masks[layer][k].sum() * cost_gc[k]
+        
+        computation_cost = computation_cost_fw + computation_cost_eb + computation_cost_gc
+
+        cp_ratio_fw = (float(computation_cost_fw) / float(computation_all)) * 100
+        cp_ratio_eb = (float(computation_cost_eb) / float(computation_all)) * 100
+        cp_ratio_gc = (float(computation_cost_gc) / float(computation_all)) * 100
+
+        cp_ratio = (float(computation_cost) / float(computation_all*3)) * 100
+
         loss = criterion(output, target_var)
 
-        # measure accuracy and record loss
+            # measure accuracy and record loss
         prec1, = accuracy(output.data, target, topk=(1,))
-        top1.update(prec1.item(), input.size(0))
         losses.update(loss.item(), input.size(0))
+        top1.update(prec1.item(), input.size(0))
+
+        cp_record.update(cp_ratio,1)
+        cp_record_fw.update(cp_ratio_fw,1)
+        cp_record_eb.update(cp_ratio_eb,1)
+        cp_record_gc.update(cp_ratio_gc,1)
+
         batch_time.update(time.time() - end)
         end = time.time()
 
-        if (i % args.print_freq == 0) or (i == len(test_loader) - 1):
-            logging.info(
-                'Test: [{}/{}]\t'
-                'Time: {batch_time.val:.4f}({batch_time.avg:.4f})\t'
-                'Loss: {loss.val:.3f}({loss.avg:.3f})\t'
-                'Prec@1: {top1.val:.3f}({top1.avg:.3f})\t'.format(
-                    i, len(test_loader), batch_time=batch_time,
-                    loss=losses, top1=top1
-                )
+        if i % args.print_freq == 0 or (i == (len(test_loader) - 1)):
+            logging.info("Iter: [{0}/{1}]\t"
+                         "Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t"
+                         "Data {data_time.val:.3f} ({data_time.avg:.3f})\t"
+                         "Loss {loss.val:.3f} ({loss.avg:.3f})\t"
+                         "Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t"
+                         "Computation_Percentage: {cp_record.val:.3f}({cp_record.avg:.3f})\t"
+                         "Computation_Percentage_FW: {cp_record_fw.val:.3f}({cp_record_fw.avg:.3f})\t"
+                         "Computation_Percentage_EB: {cp_record_eb.val:.3f}({cp_record_eb.avg:.3f})\t"
+                         "Computation_Percentage_GC: {cp_record_gc.val:.3f}({cp_record_gc.avg:.3f})\t".format(
+                            i,
+                            len(test_loader),
+                            batch_time=batch_time,
+                            data_time=data_time,
+                            loss=losses,
+                            top1=top1,
+                            cp_record=cp_record,
+                            cp_record_fw=cp_record_fw,
+                            cp_record_eb=cp_record_eb,
+                            cp_record_gc=cp_record_gc)
             )
 
     logging.info('Epoch {} * Prec@1 {top1.avg:.3f}'.format(_epoch, top1=top1))
+    
+    for layer in range(network_depth):
+        print('layer{}_decision'.format(layer + 1))
+        for g in range(len(cost_fw)):
+            print('{}_ratio{}'.format(g,layerwise_decision_statistics[layer][g].avg))
+
     return top1.avg
 
 
@@ -308,6 +507,8 @@ def validate_full_prec(args, test_loader, model, criterion, _epoch):
     losses = AverageMeter()
     top1 = AverageMeter()
 
+    bits_full = np.zeros(len(bits))
+    grad_bits_full = np.zeros(len(grad_bits))
     # switch to evaluation mode
     model.eval()
     end = time.time()
@@ -317,7 +518,7 @@ def validate_full_prec(args, test_loader, model, criterion, _epoch):
         target_var = Variable(target, volatile=True).cuda()
 
         # compute output
-        output = model(input_var, 0, 0)
+        output, _ = model(input_var, bits_full, grad_bits_full)
         loss = criterion(output, target_var)
 
         # measure accuracy and record loss
@@ -327,6 +528,8 @@ def validate_full_prec(args, test_loader, model, criterion, _epoch):
         batch_time.update(time.time() - end)
         end = time.time()
 
+        if args.gate_type == 'rnn':
+            model.module.control.repackage_hidden()
 
     logging.info('Epoch {} * Full Prec@1 {top1.avg:.3f}'.format(_epoch, top1=top1))
     return top1.avg
@@ -392,22 +595,19 @@ class AverageMeter(object):
 
 
 schedule_cnt = 0
-def adjust_precision(args, _epoch):
+def adjust_target_ratio(args, _epoch):
     if args.schedule:
         global schedule_cnt
 
-        assert len(args.num_bits_schedule) == len(args.schedule) + 1
-        assert len(args.num_grad_bits_schedule) == len(args.schedule) + 1
+        assert len(args.target_ratio_schedule) == len(args.schedule) + 1
 
         if schedule_cnt == 0:
-            args.num_bits = args.num_bits_schedule[0] 
-            args.num_grad_bits = args.num_grad_bits_schedule[0]
+            args.target_ratio = args.target_ratio_schedule[0]
             schedule_cnt += 1
 
         for step in args.schedule:
             if _epoch == step:
-                args.num_bits = args.num_bits_schedule[schedule_cnt]
-                args.num_grad_bits = args.num_grad_bits_schedule[schedule_cnt] 
+                args.target_ratio = args.target_ratio_schedule[schedule_cnt]
                 schedule_cnt += 1
 
 
